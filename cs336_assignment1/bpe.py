@@ -78,7 +78,7 @@ class BPETokenizer:
     def preprocess_corpus(self, corpus_file):
         # find the boundaries of every chunk
         with open(corpus_file, "rb") as f:
-            boundaries = find_chunk_boundaries(f, self.num_processes, self.special_tokens[0])
+            boundaries = find_chunk_boundaries(f, self.num_processes, self.special_tokens[0])   #TODO: pass list of special_tokens
         self.logger.info(f"#boundary: {len(boundaries)}: {boundaries}")
 
         # parallize pre-tokenization
