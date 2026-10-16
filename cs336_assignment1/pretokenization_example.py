@@ -1,17 +1,19 @@
 import os
-from typing import BinaryIO
+import regex as re
+from typing import BinaryIO, List
 
 
 def find_chunk_boundaries(
     file: BinaryIO,
     desired_num_chunks: int,
-    split_special_token: bytes,
+    split_special_token: List[bytes],
 ) -> list[int]:
     """
     Chunk the file into parts that can be counted independently.
     May return fewer chunks if the boundaries end up overlapping.
     """
-    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+    # assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+    pattern = rb"|".join([re.escape(item) for item in split_special_token])
 
     # Get total file size in bytes
     file.seek(0, os.SEEK_END)
@@ -19,13 +21,12 @@ def find_chunk_boundaries(
     file.seek(0)
 
     chunk_size = file_size // desired_num_chunks
-    print(f"chunk_size: {chunk_size}")
 
     # Initial guesses for chunk boundary locations, uniformly spaced
     # Chunks start on previous index, don't include last index
     chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
     chunk_boundaries[-1] = file_size
-    print(f"length of chunk_boundaries: {len(chunk_boundaries)}")
+    
     mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
 
     for bi in range(1, len(chunk_boundaries) - 1):
@@ -40,10 +41,9 @@ def find_chunk_boundaries(
                 break
 
             # Find the special token in the mini chunk
-            found_at = mini_chunk.find(split_special_token)
-            if found_at != -1:
-                chunk_boundaries[bi] = initial_position + found_at
-                print(f"set chunk_boundaries[{bi}] = {initial_position + found_at}")
+            pattern_indices = list(re.finditer(pattern, mini_chunk))
+            if len(pattern_indices):
+                chunk_boundaries[bi] = initial_position + pattern_indices[0].span()[0]
                 break
             initial_position += mini_chunk_size
 
