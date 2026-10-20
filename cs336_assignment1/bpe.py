@@ -3,16 +3,16 @@ import regex as re
 import copy
 import time
 import pickle
-from datetime import datetime
+import psutil
+import tracemalloc
 import multiprocessing as mp
-import argparse
-from typing import List, Tuple
-from collections import Counter, defaultdict
+from typing import List, Iterable, Iterator
+from collections import defaultdict
 
 from .pretokenization_example import find_chunk_boundaries
 from .plogger import ProjectLogger
 
-class BPETokenizer:
+class BPETrainer:
     def __init__(self,
         input_path: str,
         vocab_size: int,
@@ -135,7 +135,10 @@ class BPETokenizer:
     
     def train(self):
         # pre-tokenization
+        start_time = time.perf_counter()
         self.preprocess_corpus(self.train_data_path)
+        elapsed = time.perf_counter() - start_time
+        self.logger.info(f"pre-tokenization elapsed: {elapsed:.6f}(s)")
 
         iteration = 1
         while len(self.vocab) + 1 < self.vocab_size:
@@ -224,6 +227,160 @@ class BPETokenizer:
                     if self.pretokens_paircount[pretoken][item] <= 0:
                         self.pretokens_paircount[pretoken].pop(item)
 
+class Tokenizer:
+    def __init__(self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None
+    ):
+        self.vocab = vocab
+        self.reverse_vocab = {vocab[_id]: _id for _id in vocab}
+        self.merges = merges
+        if special_tokens is not None and isinstance(special_tokens[0], str):
+            self.special_tokens = [item.encode('utf-8') for item in special_tokens]
+            # match the longer pattern first
+            self.special_tokens = list(sorted(self.special_tokens, key=lambda x: len(x), reverse=True))
+        else:
+            self.special_tokens = special_tokens
+        self.sp_pattern = rb"|".join([re.escape(item) for item in self.special_tokens]) if self.special_tokens else None
+        self.pre_toke_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    @classmethod
+    def from_files(cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: list[str] | None = None
+    ):
+        with open(vocab_filepath, "rb") as f:
+            vocab = pickle.load(f)
+        with open(merges_filepath, "rb") as f:
+            merges = pickle.load(f)
+        return Tokenizer(vocab, merges, special_tokens)
+
+    def process_one_seq(self, text, pretokens_seq, pretokens_list):
+        if text == b"":
+            return
+        
+        # get pretokens and count the occurences
+        for item in re.finditer(self.pre_toke_pattern, text.decode("utf-8", errors="replace")):
+            pretoken = item.group().encode('utf-8')
+            pretokens_seq.append(pretoken)
+            pretokens_list[pretoken] = [bytes([item]) for item in list(pretoken)]
+
+    def pretokenize(self, text):
+        pattern_indices = list(re.finditer(self.sp_pattern, text)) if self.sp_pattern else []
+        
+        pretokens_seq = []
+        pretokens_list = {}
+        if len(pattern_indices) > 0:
+            last_start = 0
+            for obj in pattern_indices:
+                # find the content without special token
+                start, end = obj.span()
+                if last_start < start:
+                    self.process_one_seq(text[last_start:start], pretokens_seq, pretokens_list)
+                pretokens_seq.append(obj.group())
+                pretokens_list[obj.group()] = [obj.group()]
+
+                last_start = end
+        else:
+            last_start = 0
+
+        if len(text) and last_start < len(text):
+            self.process_one_seq(text[last_start:len(text)], pretokens_seq, pretokens_list)
+
+        return pretokens_seq, pretokens_list
+
+    def encode(self, text: str) -> list[int]:
+        if isinstance(text, str):
+            byte_text = text.encode('utf-8')
+        else:
+            byte_text = text
+        pretokens_seq, pretokens_list = self.pretokenize(byte_text)
+
+        for pretoken in pretokens_list:
+            token_seq = pretokens_list[pretoken]
+            token_pairs = list(zip(token_seq[:-1], token_seq[1:]))
+
+            cycle = 0
+            while cycle < len(self.merges):
+                merge = self.merges[cycle]
+                matched = False
+                if merge in token_pairs:
+                    index1 = [1 if merge[0] == item else 0 for item in token_seq]
+                    index2 = [1 if merge[1] == item else 0 for item in token_seq]
+                    i = 0
+                    while i < (len(index1) - 1):
+                        if index1[i] == 1 and index2[i + 1] == 1:
+                            token_seq = token_seq[:i] + [merge[0] + merge[1]] + token_seq[i + 2:]
+                            index1 = [1 if merge[0] == item else 0 for item in token_seq]
+                            index2 = [1 if merge[1] == item else 0 for item in token_seq]
+                            token_pairs = list(zip(token_seq[:-1], token_seq[1:]))
+                            matched = True
+                        i += 1
+
+                if matched:
+                    cycle = 0
+                else:
+                    cycle += 1
+            pretokens_list[pretoken] = token_seq
+
+        token_id_seqs = {}
+        for pretoken in pretokens_list:
+            token_id_seqs[pretoken] = []
+            for token in pretokens_list[pretoken]:
+                token_id_seqs[pretoken].append(self.reverse_vocab[token])
+
+        result = []
+        for seq in pretokens_seq:
+            result += token_id_seqs[seq]
+
+        return result
+
+    def get_boundary_by_pre_toke_pattern(self, text):
+        last_start_point = 0
+        for item in re.finditer(self.pre_toke_pattern, text.decode('utf-8')):
+            last_start_point = item.span()[1]
+
+        return last_start_point
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        chunk_size = 1024 * 100
+
+        # Get total file size in bytes
+        iterable.seek(0, os.SEEK_END)
+        remain_file_size = iterable.tell()
+        iterable.seek(0)
+        chunk_size = min(chunk_size, remain_file_size)
+
+        start_pos, end_pos = 0, chunk_size
+        while True:
+            iterable.seek(start_pos)
+            mini_chunk = iterable.read(chunk_size).encode('utf-8')
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"" or remain_file_size <= 0:
+                break
+
+            # find the boundary
+            pattern_indices = list(re.finditer(self.sp_pattern, mini_chunk)) if self.sp_pattern is not None else []
+            if self.sp_pattern and len(pattern_indices):
+                end_pos = pattern_indices[-1].span()[1]
+            else:
+                end_pos = self.get_boundary_by_pre_toke_pattern(mini_chunk)
+
+            for item in self.encode(mini_chunk[:end_pos]):
+                yield item
+
+            start_pos = end_pos
+            remain_file_size -= len(mini_chunk[:end_pos])
+
+    def decode(self, ids: list[int]) -> str:
+        output = b""
+        for id in ids:
+            output += self.vocab[id]
+        return output.decode('utf-8', errors='replace')
+
 def bpe_entry(input_path: str, vocab_size: int, special_tokens: List[str]):
     """
     Input
@@ -241,6 +398,29 @@ def bpe_entry(input_path: str, vocab_size: int, special_tokens: List[str]):
         item is a tuple of bytes (<token1>, <token2>), representing that <token1> was merged with 
         <token2>. The merges should be ordered by order of creation.
     """
-    bpe_tokenizer = BPETokenizer(input_path, vocab_size, special_tokens)
+    bpe_tokenizer = BPETrainer(input_path, vocab_size, special_tokens)
     bpe_tokenizer.train()
     return bpe_tokenizer.get_vocab(), bpe_tokenizer.get_merges()
+
+if __name__ == '__main__':
+    import time
+    start_time = time.perf_counter()
+
+    tracemalloc.start()
+    try:
+        vocab, merges = bpe_entry(
+            "D:\\AI\\Learning\\CS336\\Assignment 1\\assignment1-basics\\data\\owt_train.txt",
+            32000,
+            ["<|endoftext|>"]
+        )
+        with open("openwebtext.vocab", 'wb') as f1, open("openwebtext.merges", 'wb') as f2:
+            pickle.dump(vocab, f1)
+            pickle.dump(merges, f2)
+        current, peak = tracemalloc.get_traced_memory()
+        print(f"当前跟踪内存: {current / 1024**2:.2f} MB")
+        print(f"峰值跟踪内存: {peak / 1024**2:.2f} MB")
+    finally:
+        tracemalloc.stop()
+
+    elapsed = time.perf_counter() - start_time
+    print(f"elapsed: {elapsed:.6f}(s)")
