@@ -232,7 +232,7 @@ class TransformerBlock(nn.Module):
         d_model: int,
         num_heads: int,
         d_ff: int,
-        eps: float = 0.00001,
+        eps: float = 1e-5,
         max_seq_len: int = None,
         theta: float | None = None,
     ):
@@ -259,7 +259,7 @@ class TranformerLM(nn.Module):
         d_model: int,
         num_heads: int,
         d_ff: int,
-        rope_theta: float,
+        rope_theta: float | None = None,
     ):
         super(TranformerLM, self).__init__()
         
@@ -334,7 +334,7 @@ def cal_params_and_flops_of_model(
     # LM head
     flops += 2 * d_model * vocab_size * context_length
 
-    print(f"Breakdown #Flops:")
+    print(f"Breakdown Forward #Flops:")
     print(f"- Attention projection: {2 * context_length * (d_model ** 2) * 4} * {num_layers}\n  ↓")
     print(f"- Softmax Attention: {2 * (context_length ** 2) * d_model * 2} * {num_layers}\n  ↓")
     print(f"- Position-wise FFN: {2 * d_ff * d_model * context_length * 3} * {num_layers}\n  ↓")
