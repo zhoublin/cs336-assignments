@@ -129,6 +129,50 @@ def valid_model(args, model, data):
         "Evaluation loss"
     )
 
+def sample_token(args, model, input_token_ids):
+    out = model(input_token_ids)
+    x = out[:, -1]
+
+    normalized_x = x / torch.tensor(args.temperature)
+    probs = torch.exp(normalized_x) / torch.exp(normalized_x).sum(dim=-1).unsqueeze(dim=-1)
+
+    # Sort probabilities in descending order
+    sorted_probs, sorted_indices = torch.sort(
+        probs, dim=-1, descending=True
+    )
+
+    # Calculate cumulative probabilities
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    # Remove tokens outside the nucleus
+    # Keep the token that makes cumulative probability reach p
+    remove_mask = cumulative_probs - sorted_probs >= args.top_p
+
+    sorted_probs[remove_mask] = 0.0
+
+    # Renormalize probabilities
+    sorted_probs /= sorted_probs.sum(dim=-1, keepdim=True)
+
+    # Sample from the filtered distribution
+    sampled_idx = torch.multinomial(sorted_probs, num_samples=1)
+
+    # Map sorted indices back to original vocabulary indices
+    sampled_token = torch.gather(sorted_indices, dim=-1, index=sampled_idx)
+
+    return sampled_token.squeeze(-1)
+
+def decode(args, model, tokenizer, input_token_ids):
+    next_token_id = sample_token(args, model, input_token_ids)
+    gen_tokens = 0
+    while not tokenizer.whether_stop(next_token_id, "<|endoftext|>") and \
+        gen_tokens < args.max_gen_tokens:
+
+        gen_tokens += 1
+        input_token_ids.append(next_token_id)
+        next_token_id = sample_token(args, model, input_token_ids)
+
+    return tokenizer.decode(input_token_ids)
+
 def main(args):
     # 0. 训练tokenizer
     tokenizer = train_tokenizer(args)
@@ -148,7 +192,6 @@ def main(args):
 
     # 3. 测试模型
     valid_model(args, model, data)
-
 
 def parse_arguments():
     parser = argparse.ArgumentParser("Transformer LM training script (GPT-2 XL-sized default).")
@@ -185,6 +228,11 @@ def parse_arguments():
     # other
     parser.add_argument("--output_path", default="output", type=str, help="output path for saving pics and logs.")
     parser.add_argument("--checkpoint_path", default="models", type=str, help="output path for saving checkpoints.")
+
+    # inference
+    parser.add_argument("--temperature", default=0., type=float, help="temperature for token sampling.")
+    parser.add_argument("--top_p", default=1., type=float, help="top-p for token sampling.")
+    parser.add_argument("--max_gen_tokens", default=512, type=int, help="the maximum number of generated tokens.")
 
     return parser.parse_args()
 

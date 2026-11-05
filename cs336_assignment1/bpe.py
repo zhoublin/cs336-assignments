@@ -245,6 +245,9 @@ class Tokenizer:
         self.sp_pattern = rb"|".join([re.escape(item) for item in self.special_tokens]) if self.special_tokens else None
         self.pre_toke_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
+    def whether_stop(self, token_id, stop_token):
+        return self.vocab[stop_token] == token_id
+    
     @classmethod
     def from_files(cls,
         vocab_filepath: str,
